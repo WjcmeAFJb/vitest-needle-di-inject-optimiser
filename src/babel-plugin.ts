@@ -323,6 +323,18 @@ export function createNeedleDiBabelPlugin(
           return m === "bind" || m === "bindAll";
         };
 
+        // `mocks.get(Token)` / `fixture.mocks.get(Token)` — the first argument.
+        const isMocksGetArg = (path: NodePath<BT.Identifier>): boolean => {
+          const parent = path.parentPath;
+          if (!options.rewriteMockGet || !parent?.isCallExpression()) return false;
+          if (path.listKey !== "arguments" || path.key !== 0) return false;
+          const callee = parent.get("callee");
+          if (!callee.isMemberExpression() || memberPropName(t, callee.node) !== "get") return false;
+          const obj = callee.get("object");
+          if (obj.isIdentifier() && obj.node.name === "mocks") return true;
+          return obj.isMemberExpression() && memberPropName(t, obj.node) === "mocks";
+        };
+
         // ---- 3. Classify every value reference ------------------------------
         programPath.traverse({
           ReferencedIdentifier(path) {
@@ -332,7 +344,9 @@ export function createNeedleDiBabelPlugin(
             const tokenKey = tokenKeyByLocal.get(path.node.name);
             if (tokenKey !== undefined) {
               if (isInTypePosition(t, path)) return;
-              if (isInjectArg(path) || isProvideValue(path)) tokenSites.push({ path, key: tokenKey });
+              if (isInjectArg(path) || isProvideValue(path) || isMocksGetArg(path)) {
+                tokenSites.push({ path, key: tokenKey });
+              }
               return;
             }
 
@@ -347,8 +361,8 @@ export function createNeedleDiBabelPlugin(
               injectSites.push({ argPath: path, dep });
               return;
             }
-            // .bind({ provide: Dependency }) / .bindAll(...) / provider:
-            if (isProvideValue(path)) {
+            // .bind({ provide: Dependency }) / .bindAll(...) / provider:, or mocks.get(Dependency)
+            if (isProvideValue(path) || isMocksGetArg(path)) {
               dep.consumed++;
               provideSites.push({ valuePath: path, dep });
               return;

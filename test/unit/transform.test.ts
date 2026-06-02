@@ -264,4 +264,55 @@ describe.each(transforms)("%s transform", (_name, transform: TransformFn) => {
       ).toThrow(/second constructor argument/);
     });
   });
+
+  describe("mocks.get() rewrite", () => {
+    it("rewrites mocks.get(Class) and drops the now-unused import", () => {
+      const out = transform(
+        `import { inject } from '@needle-di/core';
+         import { Dependency } from './subpath';
+         const m = mocks.get(Dependency);`,
+      );
+      expect(out).toContain('mocks.get(Symbol.for("Dependency"))');
+      expect(out).not.toMatch(/import\s*{\s*Dependency\s*}\s*from\s*['"]\.\/subpath['"]/);
+    });
+
+    it("rewrites a prefixed fixture.mocks.get(Class)", () => {
+      const out = transform(
+        `import { inject } from '@needle-di/core';
+         import { Dependency } from './subpath';
+         const m = fixture.mocks.get(Dependency);`,
+      );
+      expect(out).toContain('fixture.mocks.get(Symbol.for("Dependency"))');
+    });
+
+    it("rewrites a deeply prefixed a.b.mocks.get(Class)", () => {
+      const out = transform(
+        `import { inject } from '@needle-di/core';
+         import { Dependency } from './subpath';
+         const m = a.b.mocks.get(Dependency);`,
+      );
+      expect(out).toContain('a.b.mocks.get(Symbol.for("Dependency"))');
+    });
+
+    it("rewrites mocks.get(LocalToken) using the export name", () => {
+      const out = transform(
+        `import { inject, InjectionToken } from '@needle-di/core';
+         export const Name = new InjectionToken("Name");
+         const m = mocks.get(Name);`,
+      );
+      expect(out).toContain('mocks.get(Symbol.for("Name"))');
+    });
+
+    it("does NOT touch container.get(Class) (only *.mocks.get)", () => {
+      const out = transform(
+        `import { inject } from '@needle-di/core';
+         import { Dependency } from './subpath';
+         const a = inject(Dependency);
+         const c = container.get(Dependency);`,
+      );
+      expect(out).toContain("container.get(Dependency)");
+      expect(out).toMatch(/import\s*{\s*Dependency\s*}\s*from/); // kept (still a value use)
+      expect(out).toContain("new InjectionToken(");
+    });
+  });
 });

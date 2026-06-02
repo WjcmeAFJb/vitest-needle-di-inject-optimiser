@@ -35,6 +35,14 @@ export interface NeedleDiOptimiserOptions {
   rewriteBind?: boolean;
 
   /**
+   * Rewrite the argument of a `mocks.get(Dependency)` call (e.g. a test fixture's
+   * mock registry, possibly prefixed like `fixture.mocks.get(Dependency)`) to
+   * `Symbol.for("Dependency")`, so it matches the rewritten provider token.
+   * @default true
+   */
+  rewriteMockGet?: boolean;
+
+  /**
    * Predicate deciding whether a named import should be treated as a lazy class
    * dependency. Tokens (e.g. `InjectionToken` instances, symbols, `UPPER_CASE`
    * constants) must NOT be optimised, otherwise their identity would break.
@@ -76,6 +84,7 @@ export function resolveOptions(options: NeedleDiOptimiserOptions = {}): Required
     needleModule: options.needleModule ?? "@needle-di/core",
     rewriteInject: options.rewriteInject ?? true,
     rewriteBind: options.rewriteBind ?? true,
+    rewriteMockGet: options.rewriteMockGet ?? true,
     shouldOptimise: options.shouldOptimise ?? ((info) => looksLikeClass(info.importedName)),
     tokenKey: options.tokenKey ?? ((info) => info.importedName),
     resolveRequireSpecifier: options.resolveRequireSpecifier ?? ((specifier) => specifier),

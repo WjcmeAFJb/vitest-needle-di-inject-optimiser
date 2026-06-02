@@ -375,6 +375,16 @@ export function transformNeedleDi(
     );
   };
 
+  // `mocks.get(Token)` / `fixture.mocks.get(Token)` — the first argument.
+  const isMocksGetArg = (node: Node, parent: Node): boolean => {
+    if (!options.rewriteMockGet || parent.type !== "CallExpression" || parent.arguments?.[0] !== node) return false;
+    const callee = parent.callee;
+    if (callee?.type !== "MemberExpression" || memberPropName(callee) !== "get") return false;
+    const obj = callee.object;
+    if (obj?.type === "Identifier" && obj.name === "mocks") return true;
+    return obj?.type === "MemberExpression" && memberPropName(obj) === "mocks";
+  };
+
   walk(program, (node, ancestors) => {
     if (node.type !== "Identifier") return;
     const parent = ancestors[ancestors.length - 1];
@@ -385,10 +395,10 @@ export function transformNeedleDi(
     if (tokenKey !== undefined) {
       if (parent.type === "VariableDeclarator" && parent.id === node) return; // the declaration
       if (parent.type === "ExportSpecifier") return; // re-export
-      if (isInjectArg(node, parent) || isProvideValue(node, parent, ancestors)) {
+      if (isInjectArg(node, parent) || isProvideValue(node, parent, ancestors) || isMocksGetArg(node, parent)) {
         tokenSites.push({ start: node.start, end: node.end, key: tokenKey });
       }
-      return; // any other reference (e.g. get(Token)) is left untouched
+      return; // any other reference (e.g. container.get(Token)) is left untouched
     }
 
     const dep = deps.get(node.name);
@@ -416,8 +426,9 @@ export function transformNeedleDi(
       injectSites.push({ start: node.start, end: node.end, dep });
       return;
     }
-    // container.bind({ provide: Dep }) / provider: / bindAll
-    if (isProvideValue(node, parent, ancestors)) {
+    // container.bind({ provide: Dep }) / provider: / bindAll, or mocks.get(Dep)
+    // (both just become Symbol.for(key) and consume the value reference).
+    if (isProvideValue(node, parent, ancestors) || isMocksGetArg(node, parent)) {
       dep.consumed++;
       provideSites.push({ start: node.start, end: node.end, dep });
       return;

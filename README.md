@@ -144,6 +144,7 @@ Both plugins accept the same core options (the Vite plugin adds a few more):
 | `needleModule` | `"@needle-di/core"` | Module specifier that `inject` / `InjectionToken` come from. |
 | `rewriteInject` | `true` | Rewrite `inject(Class)` into the lazy `InjectionToken` form. |
 | `rewriteBind` | `true` | Rewrite `provide:`/`provider:` class tokens in `bind`/`bindAll` to `Symbol.for(...)`. |
+| `rewriteMockGet` | `true` | Rewrite the argument of `mocks.get(Class)` / `*.mocks.get(Class)` to `Symbol.for(...)`. |
 | `shouldOptimise` | PascalCase, non-`ALL_CAPS` | Predicate deciding whether a named import is a lazy class dependency. |
 | `tokenKey` | `info => info.importedName` | The `Symbol.for(...)` key. Defaults to the **exported** name (stable across files). |
 | `resolveRequireSpecifier` | identity | Map a dependency specifier to the string used inside `require(...)`. |
@@ -163,6 +164,9 @@ Vite plugin only:
 - ✅ `inject(Token)` / `provide: Token` where `Token` is a **local, exported**
   `const Token = new InjectionToken(...)` declared in the same file — see
   [Local injection tokens](#local-injection-tokens).
+- ✅ `mocks.get(Class)` and prefixed `fixture.mocks.get(Class)` (any depth, e.g.
+  `this.fixture.mocks.get(Class)`) → `mocks.get(Symbol.for("Class"))`, so a fixture's
+  symbol-keyed mock registry matches the provider token. `container.get(...)` is left alone.
 - ✅ Adds `InjectionToken` as a value import (converting a type-only import if needed).
 - ✅ Drops the dependency's import when it is no longer referenced as a value, or downgrades
   it to `import { type Dependency }` when only type references remain.
@@ -252,7 +256,7 @@ never even handed to the plugin.
 Each GitHub Release attaches a pnpm-installable tarball:
 
 ```bash
-pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.3.0/vitest-needle-di-inject-optimiser-0.3.0.tgz
+pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.4.0/vitest-needle-di-inject-optimiser-0.4.0.tgz
 ```
 
 You can also pin it in `package.json`:
@@ -260,7 +264,7 @@ You can also pin it in `package.json`:
 ```jsonc
 {
   "devDependencies": {
-    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.3.0/vitest-needle-di-inject-optimiser-0.3.0.tgz"
+    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.4.0/vitest-needle-di-inject-optimiser-0.4.0.tgz"
   }
 }
 ```
