@@ -205,7 +205,82 @@ export function createNeedleDiBabelPlugin(
         }
 
         // Only touch files that actually use needle-di.
-        if (!importsNeedle || deps.size === 0) return;
+        if (!importsNeedle) return;
+
+        // ---- 2b. Collect local `const X = new InjectionToken(...)` tokens -----
+        interface LocalTok {
+          exportName: string;
+          exported: boolean;
+          argCount: number;
+          initPath: NodePath;
+        }
+        const localTokens = new Map<string, LocalTok>();
+        if (injectionTokenLocal) {
+          const addVarDecl = (declPath: NodePath<BT.VariableDeclaration>, exported: boolean): void => {
+            if (declPath.node.kind !== "const") return;
+            for (const dtor of declPath.get("declarations")) {
+              const id = dtor.node.id;
+              const init = dtor.node.init;
+              if (
+                t.isIdentifier(id) &&
+                init &&
+                t.isNewExpression(init) &&
+                t.isIdentifier(init.callee) &&
+                init.callee.name === injectionTokenLocal
+              ) {
+                localTokens.set(id.name, {
+                  exportName: id.name,
+                  exported,
+                  argCount: init.arguments.length,
+                  initPath: dtor.get("init") as NodePath,
+                });
+              }
+            }
+          };
+          for (const stmt of programPath.get("body")) {
+            if (stmt.isVariableDeclaration()) addVarDecl(stmt, false);
+            else if (stmt.isExportNamedDeclaration()) {
+              const d = stmt.get("declaration");
+              if (d.isVariableDeclaration()) addVarDecl(d, true);
+            }
+          }
+          for (const stmt of programPath.get("body")) {
+            if (!stmt.isExportNamedDeclaration() || stmt.node.declaration) continue;
+            for (const spec of stmt.node.specifiers) {
+              if (!t.isExportSpecifier(spec)) continue;
+              const tok = localTokens.get(spec.local.name);
+              if (tok) {
+                tok.exported = true;
+                tok.exportName = t.isIdentifier(spec.exported) ? spec.exported.name : spec.exported.value;
+              }
+            }
+          }
+        }
+
+        const eligibleToken = (name: string, tok: LocalTok): boolean =>
+          tok.exported && options.shouldOptimise({ localName: name, importedName: tok.exportName, source: "" });
+
+        // Build-time assertion: an exported InjectionToken whose references become a
+        // plain Symbol.for(...) must NOT carry a factory (2nd ctor arg).
+        for (const [name, tok] of localTokens) {
+          if (eligibleToken(name, tok) && tok.argCount >= 2) {
+            throw tok.initPath.buildCodeFrameError(
+              `[needle-di-inject-optimiser] Exported InjectionToken "${tok.exportName}" passes a second ` +
+                `constructor argument (a factory). This plugin rewrites references to exported InjectionTokens ` +
+                `into a plain Symbol.for(${JSON.stringify(tok.exportName)}), so the factory would never run. ` +
+                `Remove the factory and bind a provider for the token instead.`,
+            );
+          }
+        }
+
+        const tokenKeyByLocal = new Map<string, string>();
+        for (const [name, tok] of localTokens) {
+          if (eligibleToken(name, tok)) {
+            tokenKeyByLocal.set(name, options.tokenKey({ localName: name, importedName: tok.exportName, source: "" }));
+          }
+        }
+
+        if (deps.size === 0 && tokenKeyByLocal.size === 0) return;
 
         const depOf = (path: NodePath<BT.Identifier>): DepImport | undefined => {
           const dep = deps.get(path.node.name);
@@ -219,57 +294,64 @@ export function createNeedleDiBabelPlugin(
 
         const injectSites: Array<{ argPath: NodePath<BT.Identifier>; dep: DepImport }> = [];
         const provideSites: Array<{ valuePath: NodePath<BT.Identifier>; dep: DepImport }> = [];
+        const tokenSites: Array<{ path: NodePath<BT.Identifier>; key: string }> = [];
+
+        const isInjectArg = (path: NodePath<BT.Identifier>): boolean => {
+          const parent = path.parentPath;
+          if (!options.rewriteInject || !injectLocal || !parent?.isCallExpression()) return false;
+          if (path.listKey !== "arguments" || path.key !== 0) return false;
+          const callee = parent.get("callee");
+          return (
+            callee.isIdentifier() &&
+            callee.node.name === injectLocal &&
+            callee.scope.getBinding(injectLocal)?.path.node === injectSpecNode
+          );
+        };
+
+        const isProvideValue = (path: NodePath<BT.Identifier>): boolean => {
+          const parent = path.parentPath;
+          if (!options.rewriteBind || !parent?.isObjectProperty() || parent.node.value !== path.node) return false;
+          const key = objectKeyName(t, parent.node);
+          if (key !== "provide" && key !== "provider") return false;
+          const objExpr = parent.parentPath;
+          if (!objExpr?.isObjectExpression() || objExpr.listKey !== "arguments") return false;
+          const call = objExpr.parentPath;
+          if (!call?.isCallExpression()) return false;
+          const callee = call.get("callee");
+          if (!callee.isMemberExpression()) return false;
+          const m = memberPropName(t, callee.node);
+          return m === "bind" || m === "bindAll";
+        };
 
         // ---- 3. Classify every value reference ------------------------------
         programPath.traverse({
           ReferencedIdentifier(path) {
             if (!path.isIdentifier()) return;
+
+            // Local exported InjectionToken -> Symbol.for(key) in inject()/provide.
+            const tokenKey = tokenKeyByLocal.get(path.node.name);
+            if (tokenKey !== undefined) {
+              if (isInTypePosition(t, path)) return;
+              if (isInjectArg(path) || isProvideValue(path)) tokenSites.push({ path, key: tokenKey });
+              return;
+            }
+
             const dep = depOf(path);
             if (!dep) return;
             // Type-position references are handled by the TSTypeReference pass below.
             if (isInTypePosition(t, path)) return;
-            const parent = path.parentPath;
 
-            // inject(Dependency)  → first argument of the needle `inject` call
-            if (
-              options.rewriteInject &&
-              injectLocal &&
-              parent?.isCallExpression() &&
-              path.listKey === "arguments" &&
-              path.key === 0
-            ) {
-              const callee = parent.get("callee");
-              if (
-                callee.isIdentifier() &&
-                callee.node.name === injectLocal &&
-                callee.scope.getBinding(injectLocal)?.path.node === injectSpecNode
-              ) {
-                dep.consumed++;
-                injectSites.push({ argPath: path, dep });
-                return;
-              }
+            // inject(Dependency)
+            if (isInjectArg(path)) {
+              dep.consumed++;
+              injectSites.push({ argPath: path, dep });
+              return;
             }
-
             // .bind({ provide: Dependency }) / .bindAll(...) / provider:
-            if (options.rewriteBind && parent?.isObjectProperty() && parent.node.value === path.node) {
-              const key = objectKeyName(t, parent.node);
-              if (key === "provide" || key === "provider") {
-                const objExpr = parent.parentPath;
-                if (objExpr?.isObjectExpression() && objExpr.listKey === "arguments") {
-                  const call = objExpr.parentPath;
-                  if (call?.isCallExpression()) {
-                    const callee = call.get("callee");
-                    if (callee.isMemberExpression()) {
-                      const m = memberPropName(t, callee.node);
-                      if (m === "bind" || m === "bindAll") {
-                        dep.consumed++;
-                        provideSites.push({ valuePath: path, dep });
-                        return;
-                      }
-                    }
-                  }
-                }
-              }
+            if (isProvideValue(path)) {
+              dep.consumed++;
+              provideSites.push({ valuePath: path, dep });
+              return;
             }
 
             // Any other value usage keeps the (value) import alive.
@@ -294,7 +376,7 @@ export function createNeedleDiBabelPlugin(
           },
         });
 
-        if (injectSites.length === 0 && provideSites.length === 0) return;
+        if (injectSites.length === 0 && provideSites.length === 0 && tokenSites.length === 0) return;
 
         // ---- 4. Ensure `InjectionToken` is available as a value import ------
         let injectionTokenReady = false;
@@ -346,6 +428,10 @@ export function createNeedleDiBabelPlugin(
 
         for (const { valuePath, dep } of provideSites) {
           valuePath.replaceWith(symbolFor(t, options.tokenKey(dep)));
+        }
+
+        for (const { path, key } of tokenSites) {
+          path.replaceWith(symbolFor(t, key));
         }
 
         // ---- 6. Remove or downgrade now-unused dependency imports ----------

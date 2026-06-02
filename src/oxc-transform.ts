@@ -140,6 +140,59 @@ interface DepImport {
   typeRefs: number;
 }
 
+interface LocalToken {
+  exportName: string;
+  exported: boolean;
+  argCount: number;
+  start: number;
+}
+
+/** Collect `const X = new InjectionToken(...)` declarations (with export status). */
+function collectLocalTokens(program: Node, injectionTokenLocal: string | undefined): Map<string, LocalToken> {
+  const tokens = new Map<string, LocalToken>();
+  if (!injectionTokenLocal) return tokens;
+
+  const addVarDecl = (varDecl: Node, exported: boolean): void => {
+    if (varDecl.kind !== "const") return;
+    for (const d of varDecl.declarations ?? []) {
+      if (
+        d.id?.type === "Identifier" &&
+        d.init?.type === "NewExpression" &&
+        d.init.callee?.type === "Identifier" &&
+        d.init.callee.name === injectionTokenLocal
+      ) {
+        tokens.set(d.id.name, {
+          exportName: d.id.name,
+          exported,
+          argCount: (d.init.arguments ?? []).length,
+          start: d.init.start,
+        });
+      }
+    }
+  };
+
+  // Pass 1: collect declarations (with inline `export const` status).
+  for (const node of program.body) {
+    if (node.type === "VariableDeclaration") addVarDecl(node, false);
+    else if (node.type === "ExportNamedDeclaration" && node.declaration?.type === "VariableDeclaration") {
+      addVarDecl(node.declaration, true);
+    }
+  }
+  // Pass 2: apply `export { X as Y }` specifiers (may appear before or after the decl).
+  for (const node of program.body) {
+    if (node.type !== "ExportNamedDeclaration" || node.declaration) continue;
+    for (const s of node.specifiers ?? []) {
+      if (s.local?.type !== "Identifier") continue;
+      const tok = tokens.get(s.local.name);
+      if (tok) {
+        tok.exported = true;
+        tok.exportName = s.exported.type === "Identifier" ? s.exported.name : s.exported.value;
+      }
+    }
+  }
+  return tokens;
+}
+
 interface NeedleInfo {
   injectLocal?: string;
   injectionTokenLocal?: string;
@@ -251,14 +304,43 @@ export function transformNeedleDi(
     }
   }
 
-  if (!needle.imports || deps.size === 0) return null;
+  if (!needle.imports) return null;
+
+  // Locally-declared `const X = new InjectionToken(...)` tokens in this file.
+  const localTokens = collectLocalTokens(program, needle.injectionTokenLocal);
+
+  const eligibleToken = (name: string, tok: LocalToken): boolean =>
+    tok.exported && options.shouldOptimise({ localName: name, importedName: tok.exportName, source: "" });
+
+  // Build-time assertion: an exported InjectionToken whose references this plugin
+  // rewrites to a plain `Symbol.for(...)` must NOT carry a factory (2nd ctor arg),
+  // because that factory could then never run.
+  for (const [name, tok] of localTokens) {
+    if (eligibleToken(name, tok) && tok.argCount >= 2) {
+      const line = code.slice(0, tok.start).split("\n").length;
+      throw new Error(
+        `[needle-di-inject-optimiser] Exported InjectionToken "${tok.exportName}" (${filename}:${line}) ` +
+          `passes a second constructor argument (a factory). This plugin rewrites references to exported ` +
+          `InjectionTokens into a plain Symbol.for(${JSON.stringify(tok.exportName)}), so the factory would ` +
+          `never run. Remove the factory and bind a provider for the token instead.`,
+      );
+    }
+  }
+
+  // Eligible local tokens: their inject()/provide refs become Symbol.for(key).
+  const tokenKeyByLocal = new Map<string, string>();
+  for (const [name, tok] of localTokens) {
+    if (eligibleToken(name, tok)) {
+      tokenKeyByLocal.set(name, options.tokenKey({ localName: name, importedName: tok.exportName, source: "" }));
+    }
+  }
 
   // Drop shadowed dependency names (conservative: don't optimise ambiguous ones).
   const bound = collectBoundNames(program);
   for (const [name, dep] of deps) {
     if (bound.has(name) || !options.shouldOptimise(dep)) deps.delete(name);
   }
-  if (deps.size === 0) return null;
+  if (deps.size === 0 && tokenKeyByLocal.size === 0) return null;
 
   // ---- 2. Classify references ---------------------------------------------
   interface Site {
@@ -268,13 +350,49 @@ export function transformNeedleDi(
   }
   const injectSites: Site[] = [];
   const provideSites: Site[] = [];
+  const tokenSites: Array<{ start: number; end: number; key: string }> = [];
+
+  const isInjectArg = (node: Node, parent: Node): boolean =>
+    options.rewriteInject &&
+    !!needle.injectLocal &&
+    parent.type === "CallExpression" &&
+    parent.callee?.type === "Identifier" &&
+    parent.callee.name === needle.injectLocal &&
+    parent.arguments?.[0] === node;
+
+  const isProvideValue = (node: Node, parent: Node, ancestors: Node[]): boolean => {
+    if (!options.rewriteBind || parent.type !== "Property" || parent.value !== node) return false;
+    const key = propKeyName(parent);
+    const objExpr = ancestors[ancestors.length - 2];
+    const call = ancestors[ancestors.length - 3];
+    return (
+      (key === "provide" || key === "provider") &&
+      objExpr?.type === "ObjectExpression" &&
+      call?.type === "CallExpression" &&
+      call.callee?.type === "MemberExpression" &&
+      (memberPropName(call.callee) === "bind" || memberPropName(call.callee) === "bindAll") &&
+      !!call.arguments?.includes(objExpr)
+    );
+  };
 
   walk(program, (node, ancestors) => {
     if (node.type !== "Identifier") return;
-    const dep = deps.get(node.name);
-    if (!dep) return;
     const parent = ancestors[ancestors.length - 1];
     if (!parent) return;
+
+    // Local exported InjectionToken -> Symbol.for(key) in inject()/provide positions.
+    const tokenKey = tokenKeyByLocal.get(node.name);
+    if (tokenKey !== undefined) {
+      if (parent.type === "VariableDeclarator" && parent.id === node) return; // the declaration
+      if (parent.type === "ExportSpecifier") return; // re-export
+      if (isInjectArg(node, parent) || isProvideValue(node, parent, ancestors)) {
+        tokenSites.push({ start: node.start, end: node.end, key: tokenKey });
+      }
+      return; // any other reference (e.g. get(Token)) is left untouched
+    }
+
+    const dep = deps.get(node.name);
+    if (!dep) return;
 
     // Skip binding / non-reference positions.
     if (parent.type === "ImportSpecifier" || parent.type === "ImportDefaultSpecifier" || parent.type === "ImportNamespaceSpecifier") return;
@@ -293,42 +411,22 @@ export function transformNeedleDi(
     }
 
     // inject(Dep)
-    if (
-      options.rewriteInject &&
-      needle.injectLocal &&
-      parent.type === "CallExpression" &&
-      parent.callee?.type === "Identifier" &&
-      parent.callee.name === needle.injectLocal &&
-      parent.arguments?.[0] === node
-    ) {
+    if (isInjectArg(node, parent)) {
       dep.consumed++;
       injectSites.push({ start: node.start, end: node.end, dep });
       return;
     }
-
     // container.bind({ provide: Dep }) / provider: / bindAll
-    if (options.rewriteBind && parent.type === "Property" && parent.value === node) {
-      const key = propKeyName(parent);
-      const objExpr = ancestors[ancestors.length - 2];
-      const call = ancestors[ancestors.length - 3];
-      if (
-        (key === "provide" || key === "provider") &&
-        objExpr?.type === "ObjectExpression" &&
-        call?.type === "CallExpression" &&
-        call.callee?.type === "MemberExpression" &&
-        (memberPropName(call.callee) === "bind" || memberPropName(call.callee) === "bindAll") &&
-        call.arguments?.includes(objExpr)
-      ) {
-        dep.consumed++;
-        provideSites.push({ start: node.start, end: node.end, dep });
-        return;
-      }
+    if (isProvideValue(node, parent, ancestors)) {
+      dep.consumed++;
+      provideSites.push({ start: node.start, end: node.end, dep });
+      return;
     }
 
     dep.retainedValue++;
   });
 
-  if (injectSites.length === 0 && provideSites.length === 0) return null;
+  if (injectSites.length === 0 && provideSites.length === 0 && tokenSites.length === 0) return null;
 
   const ms = new MagicString(code);
 
@@ -401,6 +499,9 @@ export function transformNeedleDi(
   }
   for (const site of provideSites) {
     ms.overwrite(site.start, site.end, symbolForSrc(options.tokenKey(site.dep)));
+  }
+  for (const site of tokenSites) {
+    ms.overwrite(site.start, site.end, symbolForSrc(site.key));
   }
 
   // ---- 5. Remove / downgrade now-unused dependency imports ----------------

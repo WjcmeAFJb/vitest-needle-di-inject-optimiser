@@ -200,4 +200,68 @@ describe.each(transforms)("%s transform", (_name, transform: TransformFn) => {
       expect(out).toContain("new InjectionToken(");
     });
   });
+
+  describe("local exported InjectionToken", () => {
+    it("rewrites inject(LocalToken) to Symbol.for using the export name", () => {
+      const out = transform(
+        `import { inject, InjectionToken } from '@needle-di/core';
+         export const Name = new InjectionToken("Name");
+         class Foo { constructor(private x = inject(Name)) {} }`,
+      );
+      expect(out).toContain('inject(Symbol.for("Name"))');
+      // the token declaration itself is kept
+      expect(out).toContain('new InjectionToken("Name")');
+    });
+
+    it("rewrites provide: LocalToken in the same file", () => {
+      const out = transform(
+        `import { inject, InjectionToken, Container } from '@needle-di/core';
+         export const Name = new InjectionToken("Name");
+         export function setup(c: Container) { c.bind({ provide: Name, useValue: 1 }); }`,
+      );
+      expect(out).toContain('provide: Symbol.for("Name")');
+    });
+
+    it("uses the re-exported name from `export { X as Y }`", () => {
+      const out = transform(
+        `import { inject, InjectionToken } from '@needle-di/core';
+         const Tok = new InjectionToken("whatever");
+         export { Tok as Service };
+         class Foo { constructor(private x = inject(Tok)) {} }`,
+      );
+      expect(out).toContain('inject(Symbol.for("Service"))');
+      expect(out).not.toContain('Symbol.for("Tok")');
+      expect(out).not.toContain('Symbol.for("whatever")');
+    });
+
+    it("does not transform a non-exported local token", () => {
+      const out = transform(
+        `import { inject, InjectionToken } from '@needle-di/core';
+         const Local = new InjectionToken("Local");
+         class Foo { constructor(private x = inject(Local)) {} }`,
+      );
+      expect(out).toContain("inject(Local)");
+      expect(out).not.toContain('Symbol.for("Local")');
+    });
+
+    it("does not transform a non-class-named exported token (and does not assert on it)", () => {
+      const out = transform(
+        `import { inject, InjectionToken } from '@needle-di/core';
+         export const API_TOKEN = new InjectionToken("API_TOKEN", { factory: () => 1 });
+         const a = inject(API_TOKEN);`,
+      );
+      expect(out).toContain("inject(API_TOKEN)");
+      expect(out).not.toContain("Symbol.for");
+    });
+
+    it("throws a build-time error when an exported token carries a factory", () => {
+      expect(() =>
+        transform(
+          `import { inject, InjectionToken } from '@needle-di/core';
+           export const Name = new InjectionToken("Name", { factory: (c) => c.get(Symbol.for("x")) });
+           const a = inject(Name);`,
+        ),
+      ).toThrow(/second constructor argument/);
+    });
+  });
 });

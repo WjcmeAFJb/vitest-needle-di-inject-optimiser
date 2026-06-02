@@ -160,9 +160,44 @@ Vite plugin only:
 
 - ✅ `inject(Class)` where `Class` is a **named import** that looks like a class.
 - ✅ `container.bind({ provide: Class, ... })`, `provider:`, and `container.bindAll(...)`.
+- ✅ `inject(Token)` / `provide: Token` where `Token` is a **local, exported**
+  `const Token = new InjectionToken(...)` declared in the same file — see
+  [Local injection tokens](#local-injection-tokens).
 - ✅ Adds `InjectionToken` as a value import (converting a type-only import if needed).
 - ✅ Drops the dependency's import when it is no longer referenced as a value, or downgrades
   it to `import { type Dependency }` when only type references remain.
+
+## Local injection tokens
+
+A very common needle-di pattern is to declare a token next to where it's injected and
+override it from elsewhere:
+
+```ts
+// service.ts
+export const ApiBaseUrl = new InjectionToken<string>("ApiBaseUrl");
+
+class ApiClient {
+  constructor(private baseUrl = inject(ApiBaseUrl)) {}
+}
+```
+
+```ts
+// some.test.ts
+import { ApiBaseUrl } from "./service.js";
+container.bind({ provide: ApiBaseUrl, useValue: "http://localhost" });
+```
+
+Because the test rewrites `provide: ApiBaseUrl` → `provide: Symbol.for("ApiBaseUrl")`, the
+`inject(ApiBaseUrl)` in `service.ts` must use the **same** symbol. So the plugin also rewrites
+`inject(ApiBaseUrl)` (and `provide: ApiBaseUrl`) in the *defining* file to
+`Symbol.for("ApiBaseUrl")`, keyed on the **exported** name. The
+`export const ApiBaseUrl = new InjectionToken(...)` declaration is left in place.
+
+> Build-time assertion: because every reference becomes a plain `Symbol.for(...)`, an
+> **exported** `InjectionToken` that the plugin rewrites **must not pass a factory** (a second
+> constructor argument) — that factory could never run. The plugin throws a build error
+> pointing at the offending token. (Non-exported tokens, and tokens whose name isn't class-like
+> per `shouldOptimise`, are left untouched and may keep a factory.)
 
 ## Performance — why not a native (WASM) plugin?
 
@@ -217,7 +252,7 @@ never even handed to the plugin.
 Each GitHub Release attaches a pnpm-installable tarball:
 
 ```bash
-pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.2.0/vitest-needle-di-inject-optimiser-0.2.0.tgz
+pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.3.0/vitest-needle-di-inject-optimiser-0.3.0.tgz
 ```
 
 You can also pin it in `package.json`:
@@ -225,7 +260,7 @@ You can also pin it in `package.json`:
 ```jsonc
 {
   "devDependencies": {
-    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.2.0/vitest-needle-di-inject-optimiser-0.2.0.tgz"
+    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.3.0/vitest-needle-di-inject-optimiser-0.3.0.tgz"
   }
 }
 ```
