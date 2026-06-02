@@ -1,0 +1,91 @@
+{
+  "name": "vitest-needle-di-inject-optimiser",
+  "version": "0.1.0",
+  "description": "Babel + Vite/Vitest/Rolldown plugin that rewrites needle-di inject() / container.bind() so dependencies are loaded lazily via require() on demand — and can be overridden in tests without ever running the real dependency's code.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser.git"
+  },
+  "keywords": [
+    "needle-di",
+    "dependency-injection",
+    "di",
+    "babel-plugin",
+    "vite-plugin",
+    "vitest",
+    "rolldown",
+    "lazy",
+    "require",
+    "tree-shaking",
+    "mocking"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./babel": {
+      "types": "./dist/babel.d.ts",
+      "import": "./dist/babel.js",
+      "require": "./dist/babel.cjs"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js",
+      "require": "./dist/vite.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "pretest": "pnpm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "pnpm run build"
+  },
+  "dependencies": {
+    "@babel/core": "^7.28.0",
+    "@babel/plugin-syntax-decorators": "^7.27.0",
+    "@babel/plugin-syntax-jsx": "^7.27.0",
+    "@babel/plugin-syntax-typescript": "^7.27.0",
+    "@babel/types": "^7.28.0"
+  },
+  "peerDependencies": {
+    "vite": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@needle-di/core": "^1.1.2",
+    "@types/babel__core": "^7.20.5",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.0.0",
+    "vitest": "^4.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
