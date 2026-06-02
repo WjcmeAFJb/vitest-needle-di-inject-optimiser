@@ -1,4 +1,4 @@
-import { createNeedleDiBabelPlugin } from "./babel-plugin.js";
+import transformNeedleDi from "./oxc-transform.js";
 import { resolveSourceSpecifierSync } from "./resolve.js";
 import { type NeedleDiOptimiserOptions } from "./options.js";
 
@@ -7,11 +7,15 @@ interface MinimalPlugin {
   name: string;
   enforce?: "pre" | "post";
   configResolved?(config: { command?: string; test?: unknown }): void;
-  transform(
-    this: unknown,
-    code: string,
-    id: string,
-  ): Promise<{ code: string; map?: unknown } | null> | { code: string; map?: unknown } | null;
+  transform: {
+    /**
+     * Rolldown/Rollup hook filter — evaluated in Rust, so files that don't import
+     * needle-di never cross into JS at all.
+     */
+    filter?: { code?: RegExp };
+    order?: "pre" | "post";
+    handler(this: unknown, code: string, id: string): { code: string; map?: unknown } | null;
+  };
 }
 
 export interface NeedleDiVitePluginOptions extends NeedleDiOptimiserOptions {
@@ -20,15 +24,11 @@ export interface NeedleDiVitePluginOptions extends NeedleDiOptimiserOptions {
   /** Files to ignore. @default /node_modules/ */
   exclude?: RegExp | RegExp[];
   /**
-   * Extra `@babel/parser` plugins. Decorators (stage-3 `2023-05`) and TypeScript
-   * are enabled automatically based on the file extension.
-   */
-  parserPlugins?: unknown[];
-  /**
    * How to resolve the `require(...)` specifier.
-   *  - `"absolute"` (default): resolve relative specifiers to on-disk paths so
-   *    Vitest's Node `require` can load them. Recommended for tests.
-   *  - `"preserve"`: keep the original specifier (use when building for production).
+   *  - `"absolute"`: resolve relative specifiers to on-disk paths so Vitest's Node
+   *    `require` can load them. Best for tests.
+   *  - `"preserve"`: keep the original specifier (for production bundles).
+   *  Defaults to `"absolute"` in test/dev and `"preserve"` in a production `vite build`.
    */
   requireResolution?: "absolute" | "preserve";
 }
@@ -42,33 +42,28 @@ function matches(patterns: RegExp[], id: string): boolean {
   return patterns.some((re) => re.test(id));
 }
 
-function parserPluginsFor(filepath: string, extra: unknown[]): unknown[] {
-  const isTsx = /\.tsx$/.test(filepath);
-  const isJsx = /\.(jsx|mjs|cjs|js)$/.test(filepath);
-  const isTs = /\.(ts|mts|cts|tsx)$/.test(filepath);
-  const plugins: unknown[] = [];
-  if (isTs) plugins.push(isTsx ? ["typescript", { isTSX: true, dts: false }] : "typescript");
-  if (isTsx || isJsx) plugins.push("jsx");
-  plugins.push(["decorators", { version: "2023-05" }]);
-  plugins.push("importAttributes", "explicitResourceManagement");
-  return [...plugins, ...extra];
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
  * Vite / Vitest / Rolldown plugin that lazily rewrites needle-di `inject()` and
- * `container.bind()` usage. Works in any Rollup-compatible pipeline (it only uses
- * the standard `transform` hook with `enforce: "pre"`); TypeScript is preserved
- * and left for the host pipeline (esbuild) to strip.
+ * `container.bind()` usage.
+ *
+ * It parses with **oxc** (the native Rust parser, also used by rolldown) and edits
+ * with **magic-string** — no Babel, no full re-print. A rolldown `transform` hook
+ * filter keeps files that don't import needle-di entirely out of the JS hot path.
+ *
+ * Works in any Rollup-compatible pipeline (`enforce: "pre"`), including `vite build`,
+ * `rolldown`, and `rolldown-vite`. TypeScript is preserved for the host pipeline
+ * (esbuild/oxc) to strip.
  */
 export function needleDiInjectOptimiser(options: NeedleDiVitePluginOptions = {}): MinimalPlugin {
   const needleModule = options.needleModule ?? "@needle-di/core";
   const include = toArray(options.include).length ? toArray(options.include) : [/\.[cm]?[jt]sx?$/];
   const exclude = toArray(options.exclude).length ? toArray(options.exclude) : [/node_modules/];
-  const extraParserPlugins = options.parserPlugins ?? [];
   // Resolved lazily: explicit option wins; otherwise inferred from the Vite mode.
   let requireResolution = options.requireResolution;
-
-  let babelCore: typeof import("@babel/core") | undefined;
 
   return {
     name: "vitest-needle-di-inject-optimiser",
@@ -76,38 +71,27 @@ export function needleDiInjectOptimiser(options: NeedleDiVitePluginOptions = {})
     configResolved(config) {
       if (requireResolution) return; // user was explicit
       const isVitest = Boolean(config.test) || Boolean(process.env.VITEST);
-      // A production `vite build` must not bake absolute machine paths into the
-      // bundle, so preserve the original specifier there; tests/dev resolve to
-      // absolute paths so Vitest's Node `require` can find the source file.
       requireResolution = config.command === "build" && !isVitest ? "preserve" : "absolute";
     },
-    async transform(code: string, id: string) {
-      const filepath = id.split("?")[0];
-      if (matches(exclude, filepath)) return null;
-      if (!matches(include, filepath)) return null;
-      // Cheap gate: the Babel plugin only acts on files importing the needle module.
-      if (!code.includes(needleModule)) return null;
+    transform: {
+      filter: { code: new RegExp(escapeRegExp(needleModule)) },
+      order: "pre",
+      handler(code: string, id: string) {
+        const filepath = id.split("?")[0];
+        if (matches(exclude, filepath)) return null;
+        if (!matches(include, filepath)) return null;
+        if (!code.includes(needleModule)) return null;
 
-      babelCore ??= await import("@babel/core");
+        const mode = requireResolution ?? "absolute";
+        const resolveRequireSpecifier =
+          mode === "absolute"
+            ? (specifier: string) => resolveSourceSpecifierSync(specifier, filepath)
+            : options.resolveRequireSpecifier;
 
-      const mode = requireResolution ?? "absolute";
-      const resolveRequireSpecifier =
-        mode === "absolute"
-          ? (specifier: string) => resolveSourceSpecifierSync(specifier, filepath)
-          : options.resolveRequireSpecifier;
-
-      const result = await babelCore.transformAsync(code, {
-        configFile: false,
-        babelrc: false,
-        filename: filepath,
-        sourceType: "module",
-        sourceMaps: true,
-        parserOpts: { plugins: parserPluginsFor(filepath, extraParserPlugins) as never },
-        plugins: [[createNeedleDiBabelPlugin as never, { ...options, resolveRequireSpecifier }]],
-      });
-
-      if (!result || result.code == null) return null;
-      return { code: result.code, map: result.map ?? undefined };
+        const result = transformNeedleDi(code, filepath, { ...options, resolveRequireSpecifier });
+        if (!result) return null;
+        return { code: result.code, map: result.map };
+      },
     },
   };
 }

@@ -12,6 +12,6 @@ export default defineConfig({
   sourcemap: true,
   target: "node18",
   splitting: false,
-  // These are provided by the host; never bundle them in.
-  external: ["@babel/core", "@babel/types", "vite", "vitest"],
+  // These are provided by the host or are runtime deps; never bundle them in.
+  external: ["@babel/core", "@babel/types", "vite", "vitest", "oxc-parser", "magic-string"],
 });

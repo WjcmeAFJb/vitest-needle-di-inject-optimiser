@@ -87,9 +87,15 @@ export default defineConfig({
 });
 ```
 
-The plugin runs with `enforce: "pre"` and **preserves TypeScript** — type stripping is left
-to your existing pipeline (esbuild). It is a standard Rollup-compatible plugin, so it also
-works in `vite build`, `rolldown`, and `rolldown-vite`.
+The Vite/Vitest/Rolldown plugin is **not** Babel-based. It parses with
+[**oxc**](https://oxc.rs) — the native Rust parser that rolldown itself uses — and rewrites
+only the touched ranges with [`magic-string`](https://github.com/Rich-Harris/magic-string).
+There's no full re-print: your TypeScript is preserved byte-for-byte except where `inject()` /
+`bind()` are edited, and type stripping is left to the host pipeline. See
+[Performance](#performance--why-not-a-native-wasm-plugin) for the why and the numbers.
+
+It runs with `enforce: "pre"` and is a standard Rollup-compatible plugin, so it also works in
+`vite build`, `rolldown`, and `rolldown-vite`.
 
 In **Vitest / dev** it resolves the `require()` specifier to an absolute on-disk path so
 Node's `require` (which Vitest provides) can find your TypeScript source. In a production
@@ -149,7 +155,6 @@ Vite plugin only:
 | `include` | `/\.[cm]?[jt]sx?$/` | Files to process. |
 | `exclude` | `/node_modules/` | Files to skip. |
 | `requireResolution` | auto (`"absolute"` in test/dev, `"preserve"` in `vite build`) | How to resolve the `require(...)` specifier. |
-| `parserPlugins` | `[]` | Extra `@babel/parser` plugins (TypeScript + stage-3 decorators are enabled automatically). |
 
 ## What gets transformed
 
@@ -158,6 +163,33 @@ Vite plugin only:
 - ✅ Adds `InjectionToken` as a value import (converting a type-only import if needed).
 - ✅ Drops the dependency's import when it is no longer referenced as a value, or downgrades
   it to `import { type Dependency }` when only type references remain.
+
+## Performance — why not a native (WASM) plugin?
+
+The Vite/Vitest path uses **oxc** (native Rust parser, via N-API) + `magic-string`, **no
+Babel**. On a 4.4 KB module with 48 `inject()` calls:
+
+| Transform | per file | relative |
+| --- | --- | --- |
+| `@babel/core` + plugin | ~6.5 ms | 1× |
+| **oxc + magic-string** | **~0.7 ms** | **~9× faster** |
+
+On top of that, the plugin declares a rolldown/rollup **`transform` hook filter**
+(`{ filter: { code: /@needle-di\/core/ } }`). That filter is evaluated **in Rust**, so files
+that don't import needle-di never cross the Rust→JS boundary at all — most of your codebase is
+never even handed to the plugin.
+
+**Can't it be a *real* rolldown native (Rust/WASM) plugin?** Not usefully, today:
+
+- Rolldown's "native plugins" are **Rust built-ins shipped inside rolldown** (alias, resolve,
+  replace, the oxc transform). There is **no public API to register your own arbitrary
+  Rust/WASM transform** as a rolldown plugin. (The `rolldown_plugin_wasm_*` crates are for
+  *importing `.wasm` modules*, not for authoring plugins in WASM.)
+- For custom logic, the supported extension point is a **JS plugin**. The cost there is the
+  *parse*, and oxc already does the parse at native speed (it's the same parser rolldown uses
+  internally). A hand-written Rust/N-API addon would only shave the tiny JS-side walk while
+  forcing you to ship and maintain per-platform binaries — and rolldown would *still* see a JS
+  plugin wrapper. So oxc + a Rust-side hook filter captures essentially all of the win.
 
 ## Caveats & design notes
 
@@ -185,7 +217,7 @@ Vite plugin only:
 Each GitHub Release attaches a pnpm-installable tarball:
 
 ```bash
-pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.1.0/vitest-needle-di-inject-optimiser-0.1.0.tgz
+pnpm add -D https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.2.0/vitest-needle-di-inject-optimiser-0.2.0.tgz
 ```
 
 You can also pin it in `package.json`:
@@ -193,7 +225,7 @@ You can also pin it in `package.json`:
 ```jsonc
 {
   "devDependencies": {
-    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.1.0/vitest-needle-di-inject-optimiser-0.1.0.tgz"
+    "vitest-needle-di-inject-optimiser": "https://github.com/WjcmeAFJb/vitest-needle-di-inject-optimiser/releases/download/v0.2.0/vitest-needle-di-inject-optimiser-0.2.0.tgz"
   }
 }
 ```

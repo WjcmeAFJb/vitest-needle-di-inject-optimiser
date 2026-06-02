@@ -1,6 +1,6 @@
 {
   "name": "vitest-needle-di-inject-optimiser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Babel + Vite/Vitest/Rolldown plugin that rewrites needle-di inject() / container.bind() so dependencies are loaded lazily via require() on demand — and can be overridden in tests without ever running the real dependency's code.",
   "license": "MIT",
   "type": "module",
@@ -60,24 +60,28 @@
     "prepack": "pnpm run build"
   },
   "dependencies": {
-    "@babel/core": "^7.28.0",
-    "@babel/plugin-syntax-decorators": "^7.27.0",
-    "@babel/plugin-syntax-jsx": "^7.27.0",
-    "@babel/plugin-syntax-typescript": "^7.27.0",
-    "@babel/types": "^7.28.0"
+    "magic-string": "^0.30.21",
+    "oxc-parser": "^0.134.0"
   },
   "peerDependencies": {
+    "@babel/core": ">=7.0.0",
     "vite": ">=4"
   },
   "peerDependenciesMeta": {
+    "@babel/core": {
+      "optional": true
+    },
     "vite": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@babel/core": "^7.28.0",
+    "@babel/types": "^7.28.0",
     "@needle-di/core": "^1.1.2",
     "@types/babel__core": "^7.20.5",
     "@types/node": "^22.0.0",
+    "@vitest/ui": "4.1.8",
     "tsup": "^8.3.0",
     "typescript": "^5.7.0",
     "vite": "^8.0.0",

@@ -13,5 +13,11 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts"],
+    experimental: {
+      fsModuleCache: true
+    }
   },
+  server: {
+    allowedHosts: true
+  }
 });
