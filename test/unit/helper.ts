@@ -1,34 +1,24 @@
-import babel from "@babel/core";
-import { createNeedleDiBabelPlugin } from "../../src/babel-plugin.js";
-import { transformNeedleDi } from "../../src/oxc-transform.js";
+import { transformNeedleDi, collectSupplyKeys } from "../../src/oxc-transform.js";
 import type { NeedleDiOptimiserOptions } from "../../src/options.js";
 
-export type TransformFn = (code: string, options?: NeedleDiOptimiserOptions, filename?: string) => string;
+/** Run the transform; `supplied` is the project-wide supply set (gates bind/inject). */
+export function transform(
+  code: string,
+  supplied: Iterable<string> = [],
+  options: NeedleDiOptimiserOptions = {},
+  filename = "input.ts",
+): string {
+  return transformNeedleDi(code, filename, options, new Set(supplied))?.code ?? code;
+}
 
-export const transformBabel: TransformFn = (code, options = {}, filename = "input.ts") => {
-  const result = babel.transformSync(code, {
-    configFile: false,
-    babelrc: false,
-    filename,
-    parserOpts: { plugins: ["typescript", ["decorators", { version: "2023-05" }]] },
-    plugins: [[createNeedleDiBabelPlugin, options]],
-  });
-  if (!result?.code) throw new Error("transform produced no output");
-  return result.code;
-};
-
-export const transformOxc: TransformFn = (code, options = {}, filename = "input.ts") => {
-  // The oxc transform returns null when there is nothing to do; in that case the
-  // input is unchanged.
-  return transformNeedleDi(code, filename, options)?.code ?? code;
-};
-
-export const transforms: Array<[name: string, fn: TransformFn]> = [
-  ["babel", transformBabel],
-  ["oxc", transformOxc],
-];
+export function supplyKeys(code: string, options: NeedleDiOptimiserOptions = {}, filename = "input.ts"): Set<string> {
+  return collectSupplyKeys(code, filename, options);
+}
 
 /** Collapse insignificant whitespace for stable structural comparisons. */
 export function norm(code: string): string {
   return code.replace(/\s+/g, " ").trim();
 }
+
+/** Convenience: the standard supply import line used in fixtures. */
+export const SUPPLY_IMPORT = `import { supply } from 'vitest-needle-di-inject-optimiser/runtime';`;

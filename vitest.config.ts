@@ -5,9 +5,9 @@ import { needleDiInjectOptimiser } from "./dist/vite.js";
 export default defineConfig({
   plugins: [
     needleDiInjectOptimiser({
-      // Only rewrite the fixtures (production-style code) and the integration test
-      // files (which contain the container.bind overrides). Unit tests call Babel
-      // directly and must not be pre-transformed.
+      // Scan + rewrite only the fixtures (production-style code, where supply() lives)
+      // and the integration test files (which contain the container.bind overrides).
+      // Unit tests call the transform directly and must not be pre-processed.
       include: [/[\\/]test[\\/]fixtures[\\/]/, /[\\/]test[\\/]integration[\\/]/],
     }),
   ],

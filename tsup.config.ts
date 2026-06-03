@@ -3,8 +3,8 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
-    babel: "src/babel.ts",
     vite: "src/vite.ts",
+    runtime: "src/runtime.ts",
   },
   format: ["esm", "cjs"],
   dts: true,
@@ -12,6 +12,6 @@ export default defineConfig({
   sourcemap: true,
   target: "node18",
   splitting: false,
-  // These are provided by the host or are runtime deps; never bundle them in.
-  external: ["@babel/core", "@babel/types", "vite", "vitest", "oxc-parser", "magic-string"],
+  // Provided by the host or are runtime deps; never bundle them in.
+  external: ["vite", "vitest", "oxc-parser", "magic-string", "@needle-di/core"],
 });

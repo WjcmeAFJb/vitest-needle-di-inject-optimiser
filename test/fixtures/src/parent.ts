@@ -1,12 +1,13 @@
-// Production-style consumer. The plugin rewrites both `inject(...)` calls into the
-// lazy `InjectionToken` + `require()` form and removes these two value imports.
-import { inject } from "@needle-di/core";
+// Production-style consumer. `supply(X)` opts each dependency into lazy loading:
+// the plugin rewrites the argument into the InjectionToken + require() form, drops
+// these two value imports, and adds the InjectionToken import.
+import { supply } from "vitest-needle-di-inject-optimiser/runtime";
 import { HeavyService } from "./heavy-service.js";
 import { AuditService } from "./audit-service.js";
 
 export class Parent {
   constructor(
-    public heavy = inject(HeavyService),
-    public audit = inject(AuditService),
+    public heavy = supply(HeavyService),
+    public audit = supply(AuditService),
   ) {}
 }

@@ -1,7 +1,7 @@
 {
   "name": "vitest-needle-di-inject-optimiser",
-  "version": "0.4.0",
-  "description": "Babel + Vite/Vitest/Rolldown plugin that rewrites needle-di inject() / container.bind() so dependencies are loaded lazily via require() on demand — and can be overridden in tests without ever running the real dependency's code.",
+  "version": "0.5.0",
+  "description": "Vite/Vitest/Rolldown plugin that rewrites needle-di supply(Dependency) so dependencies are loaded lazily via require() on demand — and can be overridden in tests without ever running the real dependency's code.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -16,10 +16,10 @@
     "needle-di",
     "dependency-injection",
     "di",
-    "babel-plugin",
     "vite-plugin",
     "vitest",
     "rolldown",
+    "oxc",
     "lazy",
     "require",
     "tree-shaking",
@@ -31,15 +31,15 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
-    "./babel": {
-      "types": "./dist/babel.d.ts",
-      "import": "./dist/babel.js",
-      "require": "./dist/babel.cjs"
-    },
     "./vite": {
       "types": "./dist/vite.d.ts",
       "import": "./dist/vite.js",
       "require": "./dist/vite.cjs"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js",
+      "require": "./dist/runtime.cjs"
     },
     "./package.json": "./package.json"
   },
@@ -64,22 +64,16 @@
     "oxc-parser": "^0.134.0"
   },
   "peerDependencies": {
-    "@babel/core": ">=7.0.0",
+    "@needle-di/core": ">=1",
     "vite": ">=4"
   },
   "peerDependenciesMeta": {
-    "@babel/core": {
-      "optional": true
-    },
     "vite": {
       "optional": true
     }
   },
   "devDependencies": {
-    "@babel/core": "^7.28.0",
-    "@babel/types": "^7.28.0",
     "@needle-di/core": "^1.1.2",
-    "@types/babel__core": "^7.20.5",
     "@types/node": "^22.0.0",
     "@vitest/ui": "4.1.8",
     "tsup": "^8.3.0",

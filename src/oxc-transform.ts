@@ -2,8 +2,7 @@ import { parseSync, type ParseResult } from "oxc-parser";
 import MagicString from "magic-string";
 import { type NeedleDiOptimiserOptions, resolveOptions } from "./options.js";
 
-// We work against the oxc ESTree AST, which we treat structurally. Keep typing
-// loose (the AST is plain JSON with `type`/`start`/`end` on every node).
+// We work against the oxc ESTree AST structurally (plain JSON with type/start/end).
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Node = any;
 
@@ -13,7 +12,6 @@ export interface TransformResult {
 }
 
 const VALID_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-// TS nodes that wrap a *value* expression (their child stays a value reference).
 const TS_VALUE_WRAPPERS = new Set([
   "TSAsExpression",
   "TSSatisfiesExpression",
@@ -25,7 +23,7 @@ function langFor(filename: string): "js" | "jsx" | "ts" | "tsx" {
   if (/\.tsx$/.test(filename)) return "tsx";
   if (/\.(ts|mts|cts)$/.test(filename)) return "ts";
   if (/\.jsx$/.test(filename)) return "jsx";
-  return "jsx"; // .js/.mjs/.cjs — allow JSX as a superset
+  return "jsx";
 }
 
 function symbolForSrc(key: string): string {
@@ -48,7 +46,7 @@ function lazyTokenSrc(injectionTokenLocal: string, key: string, source: string, 
 
 function specifierImportedName(spec: Node): string {
   const im = spec.imported;
-  return im.type === "Identifier" ? im.name : im.value; // Identifier | StringLiteral
+  return im.type === "Identifier" ? im.name : im.value;
 }
 
 function propKeyName(prop: Node): string | undefined {
@@ -63,7 +61,32 @@ function memberPropName(node: Node): string | undefined {
   return undefined;
 }
 
-/** Generic depth-first walk that exposes the live ancestor chain (parents only). */
+/** True for identifier occurrences that are NOT value references (declarations, keys, etc.). */
+function isNonReference(node: Node, parent: Node): boolean {
+  switch (parent.type) {
+    case "ImportSpecifier":
+    case "ImportDefaultSpecifier":
+    case "ImportNamespaceSpecifier":
+    case "ExportSpecifier":
+      return true;
+    case "VariableDeclarator":
+      return parent.id === node;
+    case "Property":
+      return parent.key === node && !parent.computed && !parent.shorthand;
+    case "MemberExpression":
+      return parent.property === node && !parent.computed;
+    default:
+      return false;
+  }
+}
+
+function lineOf(code: string, offset: number): number {
+  let line = 1;
+  for (let i = 0; i < offset && i < code.length; i++) if (code[i] === "\n") line++;
+  return line;
+}
+
+/** Depth-first walk exposing the live ancestor chain (parents only). */
 function walk(node: Node, visit: (n: Node, ancestors: Node[]) => void, ancestors: Node[] = []): void {
   if (!node || typeof node !== "object") return;
   if (typeof node.type === "string") visit(node, ancestors);
@@ -80,7 +103,7 @@ function walk(node: Node, visit: (n: Node, ancestors: Node[]) => void, ancestors
   ancestors.pop();
 }
 
-/** Collect names introduced by local bindings (used to skip shadowed dependencies). */
+/** Names introduced by local bindings (used to skip shadowed dependencies). */
 function collectBoundNames(program: Node): Set<string> {
   const names = new Set<string>();
   const addPattern = (p: Node): void => {
@@ -129,6 +152,46 @@ function collectBoundNames(program: Node): Set<string> {
   return names;
 }
 
+interface LocalToken {
+  exportName: string;
+  argCount: number;
+  start: number;
+}
+
+/** Collect `const X = new InjectionToken(...)` declarations. */
+function collectLocalTokens(program: Node, injectionTokenLocal: string | undefined): Map<string, LocalToken> {
+  const tokens = new Map<string, LocalToken>();
+  if (!injectionTokenLocal) return tokens;
+  const addVarDecl = (varDecl: Node): void => {
+    if (varDecl.kind !== "const") return;
+    for (const d of varDecl.declarations ?? []) {
+      if (
+        d.id?.type === "Identifier" &&
+        d.init?.type === "NewExpression" &&
+        d.init.callee?.type === "Identifier" &&
+        d.init.callee.name === injectionTokenLocal
+      ) {
+        tokens.set(d.id.name, { exportName: d.id.name, argCount: (d.init.arguments ?? []).length, start: d.init.start });
+      }
+    }
+  };
+  for (const node of program.body) {
+    if (node.type === "VariableDeclaration") addVarDecl(node);
+    else if (node.type === "ExportNamedDeclaration" && node.declaration?.type === "VariableDeclaration") {
+      addVarDecl(node.declaration);
+    }
+  }
+  for (const node of program.body) {
+    if (node.type !== "ExportNamedDeclaration" || node.declaration) continue;
+    for (const s of node.specifiers ?? []) {
+      if (s.local?.type !== "Identifier") continue;
+      const tok = tokens.get(s.local.name);
+      if (tok) tok.exportName = s.exported.type === "Identifier" ? s.exported.name : s.exported.value;
+    }
+  }
+  return tokens;
+}
+
 interface DepImport {
   localName: string;
   importedName: string;
@@ -140,128 +203,21 @@ interface DepImport {
   typeRefs: number;
 }
 
-interface LocalToken {
-  exportName: string;
-  exported: boolean;
-  argCount: number;
-  start: number;
-}
-
-/** Collect `const X = new InjectionToken(...)` declarations (with export status). */
-function collectLocalTokens(program: Node, injectionTokenLocal: string | undefined): Map<string, LocalToken> {
-  const tokens = new Map<string, LocalToken>();
-  if (!injectionTokenLocal) return tokens;
-
-  const addVarDecl = (varDecl: Node, exported: boolean): void => {
-    if (varDecl.kind !== "const") return;
-    for (const d of varDecl.declarations ?? []) {
-      if (
-        d.id?.type === "Identifier" &&
-        d.init?.type === "NewExpression" &&
-        d.init.callee?.type === "Identifier" &&
-        d.init.callee.name === injectionTokenLocal
-      ) {
-        tokens.set(d.id.name, {
-          exportName: d.id.name,
-          exported,
-          argCount: (d.init.arguments ?? []).length,
-          start: d.init.start,
-        });
-      }
-    }
-  };
-
-  // Pass 1: collect declarations (with inline `export const` status).
-  for (const node of program.body) {
-    if (node.type === "VariableDeclaration") addVarDecl(node, false);
-    else if (node.type === "ExportNamedDeclaration" && node.declaration?.type === "VariableDeclaration") {
-      addVarDecl(node.declaration, true);
-    }
-  }
-  // Pass 2: apply `export { X as Y }` specifiers (may appear before or after the decl).
-  for (const node of program.body) {
-    if (node.type !== "ExportNamedDeclaration" || node.declaration) continue;
-    for (const s of node.specifiers ?? []) {
-      if (s.local?.type !== "Identifier") continue;
-      const tok = tokens.get(s.local.name);
-      if (tok) {
-        tok.exported = true;
-        tok.exportName = s.exported.type === "Identifier" ? s.exported.name : s.exported.value;
-      }
-    }
-  }
-  return tokens;
-}
-
-interface NeedleInfo {
+interface Imports {
+  needleImports: boolean;
   injectLocal?: string;
   injectionTokenLocal?: string;
   injectionTokenSpec?: Node;
   injectionTokenDecl?: Node;
   injectionTokenIsType?: boolean;
-  valueDecl?: Node; // a value import declaration we can append InjectionToken to
-  imports: boolean;
+  needleValueDecl?: Node;
+  supplyLocal?: string;
+  deps: Map<string, DepImport>;
 }
 
-/** Re-serialize an import declaration from a list of named specifier descriptors. */
-function serializeImport(
-  code: string,
-  decl: Node,
-  namedSpecs: Array<{ imported: string; local: string; type: boolean }>,
-  extraNamed: Array<{ imported: string; local: string }> = [],
-): string {
-  const sourceText = code.slice(decl.source.start, decl.source.end); // preserve original quotes
-  const parts: string[] = [];
-  for (const spec of decl.specifiers ?? []) {
-    if (spec.type === "ImportDefaultSpecifier") parts.push(spec.local.name);
-    else if (spec.type === "ImportNamespaceSpecifier") parts.push(`* as ${spec.local.name}`);
-  }
-  const named = [
-    ...namedSpecs.map((s) => `${s.type ? "type " : ""}${s.imported}${s.local !== s.imported ? ` as ${s.local}` : ""}`),
-    ...extraNamed.map((s) => `${s.imported}${s.local !== s.imported ? ` as ${s.local}` : ""}`),
-  ];
-  if (named.length) parts.push(`{ ${named.join(", ")} }`);
-  if (parts.length === 0) return ""; // caller removes the declaration entirely
-  const kind = decl.importKind === "type" ? "type " : "";
-  return `import ${kind}${parts.join(", ")} from ${sourceText};`;
-}
-
-function namedSpecsOf(decl: Node): Array<{ imported: string; local: string; type: boolean; spec: Node }> {
-  return (decl.specifiers ?? [])
-    .filter((s: Node) => s.type === "ImportSpecifier")
-    .map((s: Node) => ({
-      imported: specifierImportedName(s),
-      local: s.local.name,
-      type: s.importKind === "type",
-      spec: s,
-    }));
-}
-
-/**
- * Lazily rewrite needle-di `inject()` / `container.bind()` usage in a single file
- * using oxc (native parse) + magic-string (surgical edits). Returns `null` when
- * there is nothing to do (no needle-di import, or no eligible usage).
- */
-export function transformNeedleDi(
-  code: string,
-  filename: string,
-  rawOptions: NeedleDiOptimiserOptions = {},
-): TransformResult | null {
-  const options = resolveOptions(rawOptions);
-  if (!code.includes(options.needleModule)) return null;
-
-  let parsed: ParseResult;
-  try {
-    parsed = parseSync(filename, code, { sourceType: "module", lang: langFor(filename) });
-  } catch {
-    return null;
-  }
-  if (parsed.errors.length > 0) return null;
-  const program = parsed.program as Node;
-
-  // ---- 1. Collect needle + dependency imports -----------------------------
-  const needle: NeedleInfo = { imports: false };
-  const deps = new Map<string, DepImport>();
+function collectImports(program: Node, options: Required<NeedleDiOptimiserOptions>): Imports {
+  const r: Imports = { needleImports: false, deps: new Map() };
+  const isSupplyModule = (s: string): boolean => s === options.supplyModule || s.startsWith(`${options.supplyModule}/`);
 
   for (const node of program.body) {
     if (node.type !== "ImportDeclaration") continue;
@@ -269,30 +225,38 @@ export function transformNeedleDi(
     const declIsType = node.importKind === "type";
 
     if (source === options.needleModule) {
-      needle.imports = true;
+      r.needleImports = true;
       for (const spec of node.specifiers ?? []) {
         if (spec.type !== "ImportSpecifier") continue;
         const imported = specifierImportedName(spec);
         const specIsType = declIsType || spec.importKind === "type";
         if (imported === "inject" && !specIsType) {
-          needle.injectLocal = spec.local.name;
-          if (!declIsType) needle.valueDecl = node;
+          r.injectLocal = spec.local.name;
+          if (!declIsType) r.needleValueDecl = node;
         } else if (imported === "InjectionToken") {
-          needle.injectionTokenLocal = spec.local.name;
-          needle.injectionTokenSpec = spec;
-          needle.injectionTokenDecl = node;
-          needle.injectionTokenIsType = specIsType;
+          r.injectionTokenLocal = spec.local.name;
+          r.injectionTokenSpec = spec;
+          r.injectionTokenDecl = node;
+          r.injectionTokenIsType = specIsType;
         }
       }
-      if (!declIsType && !needle.valueDecl) needle.valueDecl = node;
+      if (!declIsType && !r.needleValueDecl) r.needleValueDecl = node;
+      continue;
+    }
+
+    if (isSupplyModule(source)) {
+      for (const spec of node.specifiers ?? []) {
+        if (spec.type === "ImportSpecifier" && specifierImportedName(spec) === "supply" && spec.importKind !== "type") {
+          r.supplyLocal = spec.local.name;
+        }
+      }
       continue;
     }
 
     for (const spec of node.specifiers ?? []) {
-      if (spec.type !== "ImportSpecifier") continue; // named imports only
-      const localName = spec.local.name;
-      deps.set(localName, {
-        localName,
+      if (spec.type !== "ImportSpecifier") continue;
+      r.deps.set(spec.local.name, {
+        localName: spec.local.name,
         importedName: specifierImportedName(spec),
         source,
         decl: node,
@@ -303,61 +267,126 @@ export function transformNeedleDi(
       });
     }
   }
+  return r;
+}
 
-  if (!needle.imports) return null;
+interface Analysis extends Imports {
+  localTokens: Map<string, LocalToken>;
+  tokenKeyByLocal: Map<string, string>;
+}
 
-  // Locally-declared `const X = new InjectionToken(...)` tokens in this file.
-  const localTokens = collectLocalTokens(program, needle.injectionTokenLocal);
-
-  const eligibleToken = (name: string, tok: LocalToken): boolean =>
-    tok.exported && options.shouldOptimise({ localName: name, importedName: tok.exportName, source: "" });
-
-  // Build-time assertion: an exported InjectionToken whose references this plugin
-  // rewrites to a plain `Symbol.for(...)` must NOT carry a factory (2nd ctor arg),
-  // because that factory could then never run.
+function analyze(program: Node, options: Required<NeedleDiOptimiserOptions>): Analysis {
+  const imp = collectImports(program, options);
+  const localTokens = collectLocalTokens(program, imp.injectionTokenLocal);
+  const bound = collectBoundNames(program);
+  for (const [name, dep] of imp.deps) {
+    if (bound.has(name) || !options.shouldOptimise(dep)) imp.deps.delete(name);
+  }
+  const tokenKeyByLocal = new Map<string, string>();
   for (const [name, tok] of localTokens) {
-    if (eligibleToken(name, tok) && tok.argCount >= 2) {
-      const line = code.slice(0, tok.start).split("\n").length;
+    const info = { localName: name, importedName: tok.exportName, source: "" };
+    if (options.shouldOptimise(info)) tokenKeyByLocal.set(name, options.tokenKey(info));
+  }
+  return { ...imp, localTokens, tokenKeyByLocal };
+}
+
+/** The Symbol.for key for an identifier name, if it is an eligible dep or local token. */
+function keyForName(name: string, a: Analysis, options: Required<NeedleDiOptimiserOptions>): string | undefined {
+  const dep = a.deps.get(name);
+  if (dep) return options.tokenKey(dep);
+  return a.tokenKeyByLocal.get(name);
+}
+
+/**
+ * Scan a single file for the keys of every `supply(X)` call. Used to build the
+ * project-wide supply set.
+ */
+export function collectSupplyKeys(
+  code: string,
+  filename: string,
+  rawOptions: NeedleDiOptimiserOptions = {},
+): Set<string> {
+  const options = resolveOptions(rawOptions);
+  const keys = new Set<string>();
+  if (!code.includes(options.supplyModule)) return keys;
+
+  let parsed: ParseResult;
+  try {
+    parsed = parseSync(filename, code, { sourceType: "module", lang: langFor(filename) });
+  } catch {
+    return keys;
+  }
+  if (parsed.errors.length > 0) return keys;
+
+  const a = analyze(parsed.program as Node, options);
+  if (a.supplyLocal === undefined) return keys;
+
+  walk(parsed.program as Node, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      node.callee?.type === "Identifier" &&
+      node.callee.name === a.supplyLocal &&
+      node.arguments?.[0]?.type === "Identifier"
+    ) {
+      const key = keyForName(node.arguments[0].name, a, options);
+      if (key !== undefined) keys.add(key);
+    }
+  });
+  return keys;
+}
+
+/**
+ * Rewrite a single file. `suppliedKeys` is the project-wide set of `Symbol.for`
+ * keys that appear in some `supply(...)` call; it gates `bind` rewriting and the
+ * `inject()` diagnostic.
+ */
+export function transformNeedleDi(
+  code: string,
+  filename: string,
+  rawOptions: NeedleDiOptimiserOptions = {},
+  suppliedKeys: ReadonlySet<string> = new Set(),
+): TransformResult | null {
+  const options = resolveOptions(rawOptions);
+  if (!code.includes(options.needleModule) && !code.includes(options.supplyModule)) return null;
+
+  let parsed: ParseResult;
+  try {
+    parsed = parseSync(filename, code, { sourceType: "module", lang: langFor(filename) });
+  } catch {
+    return null;
+  }
+  if (parsed.errors.length > 0) return null;
+  const program = parsed.program as Node;
+
+  const a = analyze(program, options);
+  if (!a.needleImports && a.supplyLocal === undefined) return null;
+
+  // Build-time assertion: a supplied local InjectionToken must not carry a factory.
+  for (const [name, tok] of a.localTokens) {
+    const key = a.tokenKeyByLocal.get(name);
+    if (key !== undefined && suppliedKeys.has(key) && tok.argCount >= 2) {
       throw new Error(
-        `[needle-di-inject-optimiser] Exported InjectionToken "${tok.exportName}" (${filename}:${line}) ` +
-          `passes a second constructor argument (a factory). This plugin rewrites references to exported ` +
-          `InjectionTokens into a plain Symbol.for(${JSON.stringify(tok.exportName)}), so the factory would ` +
-          `never run. Remove the factory and bind a provider for the token instead.`,
+        `[needle-di-inject-optimiser] InjectionToken "${tok.exportName}" (${filename}:${lineOf(code, tok.start)}) ` +
+          `is supply()-ed somewhere but passes a second constructor argument (a factory). supply() rewrites it to a ` +
+          `plain Symbol.for(${JSON.stringify(tok.exportName)}), so the factory would never run. Remove the factory.`,
       );
     }
   }
 
-  // Eligible local tokens: their inject()/provide refs become Symbol.for(key).
-  const tokenKeyByLocal = new Map<string, string>();
-  for (const [name, tok] of localTokens) {
-    if (eligibleToken(name, tok)) {
-      tokenKeyByLocal.set(name, options.tokenKey({ localName: name, importedName: tok.exportName, source: "" }));
-    }
-  }
-
-  // Drop shadowed dependency names (conservative: don't optimise ambiguous ones).
-  const bound = collectBoundNames(program);
-  for (const [name, dep] of deps) {
-    if (bound.has(name) || !options.shouldOptimise(dep)) deps.delete(name);
-  }
-  if (deps.size === 0 && tokenKeyByLocal.size === 0) return null;
-
-  // ---- 2. Classify references ---------------------------------------------
-  interface Site {
-    start: number;
-    end: number;
-    dep: DepImport;
-  }
-  const injectSites: Site[] = [];
-  const provideSites: Site[] = [];
-  const tokenSites: Array<{ start: number; end: number; key: string }> = [];
-
-  const isInjectArg = (node: Node, parent: Node): boolean =>
-    options.rewriteInject &&
-    !!needle.injectLocal &&
+  // --- helpers for call-shape detection ---
+  const isSupplyArg = (node: Node, parent: Node): boolean =>
+    options.rewriteSupply &&
+    a.supplyLocal !== undefined &&
     parent.type === "CallExpression" &&
     parent.callee?.type === "Identifier" &&
-    parent.callee.name === needle.injectLocal &&
+    parent.callee.name === a.supplyLocal &&
+    parent.arguments?.[0] === node;
+
+  const isInjectArg = (node: Node, parent: Node): boolean =>
+    a.injectLocal !== undefined &&
+    parent.type === "CallExpression" &&
+    parent.callee?.type === "Identifier" &&
+    parent.callee.name === a.injectLocal &&
     parent.arguments?.[0] === node;
 
   const isProvideValue = (node: Node, parent: Node, ancestors: Node[]): boolean => {
@@ -375,90 +404,88 @@ export function transformNeedleDi(
     );
   };
 
-  // `mocks.get(Token)` / `fixture.mocks.get(Token)` — the first argument.
-  const isMocksGetArg = (node: Node, parent: Node): boolean => {
-    if (!options.rewriteMockGet || parent.type !== "CallExpression" || parent.arguments?.[0] !== node) return false;
-    const callee = parent.callee;
-    if (callee?.type !== "MemberExpression" || memberPropName(callee) !== "get") return false;
-    const obj = callee.object;
-    if (obj?.type === "Identifier" && obj.name === "mocks") return true;
-    return obj?.type === "MemberExpression" && memberPropName(obj) === "mocks";
+  const injectError = (name: string, key: string, start: number): never => {
+    throw new Error(
+      `[needle-di-inject-optimiser] inject(${name}) at ${filename}:${lineOf(code, start)} — "${name}" is ` +
+        `supply()-ed elsewhere, so it is resolved via Symbol.for(${JSON.stringify(key)}). An eager inject() here ` +
+        `would bypass that token and overrides would not apply. Use supply(${name}) instead (or stop supplying it).`,
+    );
   };
+
+  // --- classify references ---
+  const supplyClassSites: Array<{ start: number; end: number; dep: DepImport; key: string }> = [];
+  const symbolSites: Array<{ start: number; end: number; key: string }> = []; // supply(token) + supplied provide
 
   walk(program, (node, ancestors) => {
     if (node.type !== "Identifier") return;
     const parent = ancestors[ancestors.length - 1];
-    if (!parent) return;
+    if (!parent || isNonReference(node, parent)) return;
+    const name = node.name;
 
-    // Local exported InjectionToken -> Symbol.for(key) in inject()/provide positions.
-    const tokenKey = tokenKeyByLocal.get(node.name);
+    // Local exported InjectionToken
+    const tokenKey = a.tokenKeyByLocal.get(name);
     if (tokenKey !== undefined) {
-      if (parent.type === "VariableDeclarator" && parent.id === node) return; // the declaration
-      if (parent.type === "ExportSpecifier") return; // re-export
-      if (isInjectArg(node, parent) || isProvideValue(node, parent, ancestors) || isMocksGetArg(node, parent)) {
-        tokenSites.push({ start: node.start, end: node.end, key: tokenKey });
+      if (isSupplyArg(node, parent)) {
+        symbolSites.push({ start: node.start, end: node.end, key: tokenKey });
+      } else if (isInjectArg(node, parent)) {
+        if (options.diagnoseInject && suppliedKeys.has(tokenKey)) injectError(name, tokenKey, node.start);
+      } else if (isProvideValue(node, parent, ancestors) && suppliedKeys.has(tokenKey)) {
+        symbolSites.push({ start: node.start, end: node.end, key: tokenKey });
       }
-      return; // any other reference (e.g. container.get(Token)) is left untouched
+      return;
     }
 
-    const dep = deps.get(node.name);
+    const dep = a.deps.get(name);
     if (!dep) return;
 
-    // Skip binding / non-reference positions.
-    if (parent.type === "ImportSpecifier" || parent.type === "ImportDefaultSpecifier" || parent.type === "ImportNamespaceSpecifier") return;
-    if (parent.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand) return;
-    if (parent.type === "MemberExpression" && parent.property === node && !parent.computed) return;
-
-    // `typeof Dep` requires Dep to remain a value binding.
     if (parent.type === "TSTypeQuery") {
       dep.retainedValue++;
       return;
     }
-    // Any other TS type position is an erasable type reference.
     if (typeof parent.type === "string" && parent.type.startsWith("TS") && !TS_VALUE_WRAPPERS.has(parent.type)) {
       dep.typeRefs++;
       return;
     }
 
-    // inject(Dep)
+    const key = options.tokenKey(dep);
+    if (isSupplyArg(node, parent)) {
+      dep.consumed++;
+      supplyClassSites.push({ start: node.start, end: node.end, dep, key });
+      return;
+    }
     if (isInjectArg(node, parent)) {
-      dep.consumed++;
-      injectSites.push({ start: node.start, end: node.end, dep });
+      if (options.diagnoseInject && suppliedKeys.has(key)) injectError(name, key, node.start);
+      dep.retainedValue++; // left as-is; X is still referenced as a value
       return;
     }
-    // container.bind({ provide: Dep }) / provider: / bindAll, or mocks.get(Dep)
-    // (both just become Symbol.for(key) and consume the value reference).
-    if (isProvideValue(node, parent, ancestors) || isMocksGetArg(node, parent)) {
-      dep.consumed++;
-      provideSites.push({ start: node.start, end: node.end, dep });
+    if (isProvideValue(node, parent, ancestors)) {
+      if (suppliedKeys.has(key)) {
+        dep.consumed++;
+        symbolSites.push({ start: node.start, end: node.end, key });
+      } else {
+        dep.retainedValue++;
+      }
       return;
     }
-
     dep.retainedValue++;
   });
 
-  if (injectSites.length === 0 && provideSites.length === 0 && tokenSites.length === 0) return null;
+  if (supplyClassSites.length === 0 && symbolSites.length === 0) return null;
 
   const ms = new MagicString(code);
 
-  // ---- 3. Ensure InjectionToken is available as a value import ------------
-  let injectionTokenLocal = needle.injectionTokenLocal;
-  let injectionTokenReady = needle.injectionTokenLocal !== undefined && !needle.injectionTokenIsType;
-
+  // Ensure InjectionToken value import (only needed for class supply sites).
+  let injectionTokenLocal = a.injectionTokenLocal;
+  let injectionTokenReady = a.injectionTokenLocal !== undefined && !a.injectionTokenIsType;
   const ensureInjectionToken = (): string => {
     if (injectionTokenReady && injectionTokenLocal) return injectionTokenLocal;
-
-    const valueDecl = needle.valueDecl;
-    const itDecl = needle.injectionTokenDecl;
-
-    // Choose the local name: reuse an existing (type) InjectionToken local, else a
-    // non-colliding fresh name.
+    const valueDecl = a.needleValueDecl;
     let local: string;
-    if (needle.injectionTokenLocal) {
-      local = needle.injectionTokenLocal;
-    } else {
-      const taken = new Set<string>([...deps.keys(), ...bound]);
-      if (needle.injectLocal) taken.add(needle.injectLocal);
+    if (a.injectionTokenLocal) local = a.injectionTokenLocal;
+    else {
+      const taken = new Set<string>([...a.deps.keys()]);
+      if (a.injectLocal) taken.add(a.injectLocal);
+      if (a.supplyLocal) taken.add(a.supplyLocal);
       if (!taken.has("InjectionToken")) local = "InjectionToken";
       else {
         let i = 1;
@@ -466,19 +493,14 @@ export function transformNeedleDi(
         local = `InjectionToken$${i}`;
       }
     }
-
-    // If a type-only InjectionToken lives in a DIFFERENT declaration, strip it there
-    // (the same-declaration case is handled by reconstructing valueDecl below).
-    if (needle.injectionTokenIsType && itDecl && itDecl !== valueDecl) {
-      rewriteOrRemoveSpecifier(ms, code, itDecl, needle.injectionTokenSpec);
+    if (a.injectionTokenIsType && a.injectionTokenDecl && a.injectionTokenDecl !== valueDecl) {
+      rewriteOrRemoveSpecifier(ms, code, a.injectionTokenDecl, a.injectionTokenSpec);
     }
-
     if (!valueDecl) {
       ms.prepend(
         `import { InjectionToken${local !== "InjectionToken" ? ` as ${local}` : ""} } from ${JSON.stringify(options.needleModule)};\n`,
       );
     } else {
-      // Reconstruct valueDecl so InjectionToken is present exactly once, as a value.
       const named = namedSpecsOf(valueDecl).map((s) => ({ imported: s.imported, local: s.local, type: s.type }));
       const existing = named.find((s) => s.imported === "InjectionToken");
       if (existing) {
@@ -488,61 +510,81 @@ export function transformNeedleDi(
       const extra = existing ? [] : [{ imported: "InjectionToken", local }];
       ms.overwrite(valueDecl.start, valueDecl.end, serializeImport(code, valueDecl, named, extra));
     }
-
     injectionTokenLocal = local;
     injectionTokenReady = true;
     return local;
   };
 
-  // ---- 4. Apply edits -----------------------------------------------------
-  for (const site of injectSites) {
+  // --- apply edits ---
+  for (const site of supplyClassSites) {
     const local = ensureInjectionToken();
     ms.overwrite(
       site.start,
       site.end,
-      lazyTokenSrc(
-        local,
-        options.tokenKey(site.dep),
-        options.resolveRequireSpecifier(site.dep.source, filename),
-        site.dep.importedName,
-      ),
+      lazyTokenSrc(local, site.key, options.resolveRequireSpecifier(site.dep.source, filename), site.dep.importedName),
     );
   }
-  for (const site of provideSites) {
-    ms.overwrite(site.start, site.end, symbolForSrc(options.tokenKey(site.dep)));
-  }
-  for (const site of tokenSites) {
+  for (const site of symbolSites) {
     ms.overwrite(site.start, site.end, symbolForSrc(site.key));
   }
 
-  // ---- 5. Remove / downgrade now-unused dependency imports ----------------
+  // --- remove / downgrade now-unused dependency imports ---
   const declsToRewrite = new Set<Node>();
-  for (const dep of deps.values()) {
+  for (const dep of a.deps.values()) {
     if (dep.consumed === 0 || dep.retainedValue > 0) continue;
     declsToRewrite.add(dep.decl);
   }
   for (const decl of declsToRewrite) {
-    const depsOnDecl = [...deps.values()].filter((d) => d.decl === decl && d.consumed > 0 && d.retainedValue === 0);
+    const depsOnDecl = [...a.deps.values()].filter((d) => d.decl === decl && d.consumed > 0 && d.retainedValue === 0);
     const named = namedSpecsOf(decl).flatMap((s) => {
       const dep = depsOnDecl.find((d) => d.spec === s.spec);
       if (!dep) return [{ imported: s.imported, local: s.local, type: s.type }];
-      if (dep.typeRefs > 0) return [{ imported: s.imported, local: s.local, type: true }]; // downgrade
-      return []; // drop
+      if (dep.typeRefs > 0) return [{ imported: s.imported, local: s.local, type: true }];
+      return [];
     });
     const hasOther = (decl.specifiers ?? []).some(
       (s: Node) => s.type === "ImportDefaultSpecifier" || s.type === "ImportNamespaceSpecifier",
     );
-    if (named.length === 0 && !hasOther) {
-      removeDeclaration(ms, code, decl);
-    } else {
-      ms.overwrite(decl.start, decl.end, serializeImport(code, decl, named));
-    }
+    if (named.length === 0 && !hasOther) removeDeclaration(ms, code, decl);
+    else ms.overwrite(decl.start, decl.end, serializeImport(code, decl, named));
   }
 
   return { code: ms.toString(), map: ms.generateMap({ source: filename, includeContent: true, hires: true }) };
 }
 
-/** Remove an import declaration plus a single trailing newline, if present. */
+function serializeImport(
+  code: string,
+  decl: Node,
+  namedSpecs: Array<{ imported: string; local: string; type: boolean }>,
+  extraNamed: Array<{ imported: string; local: string }> = [],
+): string {
+  const sourceText = code.slice(decl.source.start, decl.source.end);
+  const parts: string[] = [];
+  for (const spec of decl.specifiers ?? []) {
+    if (spec.type === "ImportDefaultSpecifier") parts.push(spec.local.name);
+    else if (spec.type === "ImportNamespaceSpecifier") parts.push(`* as ${spec.local.name}`);
+  }
+  const named = [
+    ...namedSpecs.map((s) => `${s.type ? "type " : ""}${s.imported}${s.local !== s.imported ? ` as ${s.local}` : ""}`),
+    ...extraNamed.map((s) => `${s.imported}${s.local !== s.imported ? ` as ${s.local}` : ""}`),
+  ];
+  if (named.length) parts.push(`{ ${named.join(", ")} }`);
+  if (parts.length === 0) return "";
+  const kind = decl.importKind === "type" ? "type " : "";
+  return `import ${kind}${parts.join(", ")} from ${sourceText};`;
+}
+
+function namedSpecsOf(decl: Node): Array<{ imported: string; local: string; type: boolean; spec: Node }> {
+  return (decl.specifiers ?? [])
+    .filter((s: Node) => s.type === "ImportSpecifier")
+    .map((s: Node) => ({
+      imported: specifierImportedName(s),
+      local: s.local.name,
+      type: s.importKind === "type",
+      spec: s,
+    }));
+}
+
 function removeDeclaration(ms: MagicString, code: string, decl: Node): void {
   let end = decl.end;
   if (code[end] === "\r") end++;
@@ -550,7 +592,6 @@ function removeDeclaration(ms: MagicString, code: string, decl: Node): void {
   ms.remove(decl.start, end);
 }
 
-/** Remove a single named specifier from a declaration (or the whole decl if it empties). */
 function rewriteOrRemoveSpecifier(ms: MagicString, code: string, decl: Node, spec: Node): void {
   const remaining = namedSpecsOf(decl)
     .filter((s) => s.spec !== spec)
